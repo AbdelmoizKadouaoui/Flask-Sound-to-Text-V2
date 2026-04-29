@@ -1,136 +1,234 @@
 import json
+import os
 import shutil
 import subprocess
 import uuid
 import wave
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any
 
-from vosk import KaldiRecognizer, Model, SetLogLevel
+from vosk import KaldiRecognizer, Model
 
-from config import GENERATED_DIR, UPLOAD_DIR, VOSK_MODELS
-
-SetLogLevel(-1)
-
-_MODEL_CACHE: Dict[str, Model] = {}
+from config import MODELS_DIR, UPLOADS_DIR, VOSK_MODELS
 
 
-class STTError(RuntimeError):
+class STTError(Exception):
     pass
 
 
-def available_languages() -> Dict[str, dict]:
-    return {
-        key: {
-            "label": item["label"],
-            "installed": Path(item["path"]).exists(),
-            "path": str(item["path"]),
+_MODEL_CACHE: dict[str, Model] = {}
+
+
+def _ffmpeg_bin() -> str | None:
+    return os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg")
+
+
+def _model_path(lang: str) -> Path:
+    if lang == "ar_linto":
+        return MODELS_DIR / VOSK_MODELS["ar_linto"]["folder"]
+    if lang.startswith("ar"):
+        primary = MODELS_DIR / VOSK_MODELS["ar"]["folder"]
+        fallback = MODELS_DIR / VOSK_MODELS["ar_linto"]["folder"]
+        return primary if primary.exists() else fallback
+    return MODELS_DIR / VOSK_MODELS["fr"]["folder"]
+
+
+def _installed_langs() -> list[str]:
+    langs = []
+    if (MODELS_DIR / VOSK_MODELS["fr"]["folder"]).exists():
+        langs.append("fr")
+    if (MODELS_DIR / VOSK_MODELS["ar"]["folder"]).exists():
+        langs.append("ar")
+    elif (MODELS_DIR / VOSK_MODELS["ar_linto"]["folder"]).exists():
+        langs.append("ar")
+    return langs
+
+
+def available_languages() -> list[dict[str, Any]]:
+    langs = [
+        {
+            "code": "auto",
+            "label": "Auto FR/AR",
+            "installed": len(_installed_langs()) > 0,
+            "folder": "auto",
         }
-        for key, item in VOSK_MODELS.items()
-    }
+    ]
 
-
-def _ensure_dirs() -> None:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _require_ffmpeg() -> None:
-    if shutil.which("ffmpeg") is None:
-        raise STTError(
-            "ffmpeg n'est pas trouvé par Flask. Ouvre /api/debug/ffmpeg pour vérifier. "
-            "Windows: winget install Gyan.FFmpeg puis ferme/réouvre PowerShell/VS Code."
+    for code in ["fr", "ar", "ar_linto"]:
+        info = VOSK_MODELS[code]
+        path = MODELS_DIR / info["folder"]
+        langs.append(
+            {
+                "code": code,
+                "label": info["label"],
+                "installed": path.exists(),
+                "folder": info["folder"],
+            }
         )
+    return langs
 
 
 def _load_model(lang: str) -> Model:
-    if lang not in VOSK_MODELS:
-        raise STTError(f"Langue non supportée: {lang}")
-
-    model_path = Path(VOSK_MODELS[lang]["path"])
-    if not model_path.exists():
+    path = _model_path(lang)
+    if not path.exists():
         raise STTError(
-            f"Modèle Vosk introuvable pour '{lang}'. Chemin attendu: {model_path}. "
+            f"Modèle Vosk introuvable pour '{lang}'. Dossier attendu: {path}. "
             "Lance: python download_models.py"
         )
 
-    if lang not in _MODEL_CACHE:
-        _MODEL_CACHE[lang] = Model(str(model_path))
-    return _MODEL_CACHE[lang]
+    cache_key = str(path.resolve())
+    if cache_key not in _MODEL_CACHE:
+        _MODEL_CACHE[cache_key] = Model(cache_key)
+    return _MODEL_CACHE[cache_key]
 
 
-def _convert_to_wav_16k_mono(input_path: Path, output_path: Path) -> None:
-    _require_ffmpeg()
-    cmd = [
-        "ffmpeg",
+def _convert_to_wav(input_path: Path, output_path: Path) -> None:
+    ffmpeg = _ffmpeg_bin()
+    if not ffmpeg:
+        raise STTError(
+            "ffmpeg n'est pas installé ou introuvable. Installe-le ou ajoute FFMPEG_PATH."
+        )
+
+    command = [
+        ffmpeg,
         "-y",
         "-i",
         str(input_path),
-        "-ar",
-        "16000",
         "-ac",
         "1",
+        "-ar",
+        "16000",
         "-f",
         "wav",
         str(output_path),
     ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
-        raise STTError("Conversion audio échouée avec ffmpeg: " + result.stderr[-1000:])
+        detail = result.stderr.decode("utf-8", errors="ignore")[-1200:]
+        raise STTError(f"Erreur conversion audio avec ffmpeg: {detail}")
 
 
-def transcribe_audio(file_storage, lang: str) -> Tuple[str, dict]:
-    """Receive a Flask FileStorage, convert browser audio to 16k PCM WAV, run Vosk."""
-    _ensure_dirs()
+def _transcribe_wav(wav_path: Path, lang: str) -> tuple[str, dict[str, Any]]:
+    model = _load_model(lang)
 
-    ext = Path(file_storage.filename or "audio.webm").suffix or ".webm"
-    raw_path = UPLOAD_DIR / f"recording_{uuid.uuid4().hex}{ext}"
-    wav_path = UPLOAD_DIR / f"recording_{uuid.uuid4().hex}.wav"
+    with wave.open(str(wav_path), "rb") as wf:
+        if wf.getnchannels() != 1 or wf.getsampwidth() != 2:
+            raise STTError("Audio WAV invalide. Il doit être mono PCM 16-bit.")
+
+        rec = KaldiRecognizer(model, wf.getframerate())
+        rec.SetWords(True)
+
+        partials = []
+        while True:
+            data = wf.readframes(4000)
+            if len(data) == 0:
+                break
+            if rec.AcceptWaveform(data):
+                partials.append(json.loads(rec.Result()))
+
+        final = json.loads(rec.FinalResult())
+
+    segments = partials + [final]
+    words = []
+    texts = []
+
+    for segment in segments:
+        text = (segment.get("text") or "").strip()
+        if text:
+            texts.append(text)
+        for word in segment.get("result") or []:
+            words.append(word)
+
+    text = " ".join(texts).strip()
+    conf_values = [float(w.get("conf", 0.0)) for w in words if "conf" in w]
+    avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0.0
+
+    return text, {
+        "lang": lang,
+        "avg_conf": round(avg_conf, 4),
+        "word_count": len(words),
+        "text_length": len(text),
+    }
+
+
+def _contains_arabic(text: str) -> bool:
+    return any("\u0600" <= ch <= "\u06FF" or "\u0750" <= ch <= "\u077F" for ch in text)
+
+
+def _auto_choose(candidates: list[tuple[str, str, dict[str, Any]]]) -> tuple[str, dict[str, Any]]:
+    if not candidates:
+        return "", {"lang": "auto", "candidates": []}
+
+    scored = []
+    for lang, text, meta in candidates:
+        score = float(meta.get("avg_conf", 0.0))
+        score += min(len(text), 160) / 1600.0
+        score += min(int(meta.get("word_count", 0)), 25) / 500.0
+
+        # Script bonus: Arabic model output usually contains Arabic script.
+        if lang.startswith("ar") and _contains_arabic(text):
+            score += 0.12
+        if lang == "fr" and text and not _contains_arabic(text):
+            score += 0.05
+
+        scored.append((score, lang, text, meta))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_lang, best_text, best_meta = scored[0]
+    return best_text, {
+        "lang": best_lang,
+        "auto": True,
+        "score": round(best_score, 4),
+        "candidates": [
+            {
+                "lang": lang,
+                "score": round(score, 4),
+                "avg_conf": meta.get("avg_conf"),
+                "word_count": meta.get("word_count"),
+                "text": text,
+            }
+            for score, lang, text, meta in scored
+        ],
+    }
+
+
+def transcribe_audio(audio_file, lang: str = "auto") -> tuple[str, dict[str, Any]]:
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+    suffix = Path(audio_file.filename or "audio.webm").suffix or ".webm"
+    raw_path = UPLOADS_DIR / f"input_{uuid.uuid4().hex}{suffix}"
+    wav_path = UPLOADS_DIR / f"converted_{uuid.uuid4().hex}.wav"
+
+    audio_file.save(raw_path)
 
     try:
-        file_storage.save(raw_path)
+        _convert_to_wav(raw_path, wav_path)
 
-        if not raw_path.exists() or raw_path.stat().st_size == 0:
-            raise STTError("Fichier audio vide reçu par Flask.")
+        requested = (lang or "auto").lower().strip()
+        if requested in {"", "auto"}:
+            installed = _installed_langs()
+            if not installed:
+                raise STTError("Aucun modèle Vosk installé. Lance: python download_models.py")
+            if len(installed) == 1:
+                text, meta = _transcribe_wav(wav_path, installed[0])
+                meta["auto"] = True
+                return text, meta
 
-        _convert_to_wav_16k_mono(raw_path, wav_path)
+            candidates = []
+            for candidate_lang in installed:
+                try:
+                    text, meta = _transcribe_wav(wav_path, candidate_lang)
+                    candidates.append((candidate_lang, text, meta))
+                except Exception as error:
+                    candidates.append((candidate_lang, "", {"error": str(error), "avg_conf": 0, "word_count": 0}))
+            return _auto_choose(candidates)
 
-        model = _load_model(lang)
-        recognizer = KaldiRecognizer(model, 16000)
-        recognizer.SetWords(True)
-
-        final_text_parts = []
-        partial_meta = []
-        frames_read = 0
-
-        with wave.open(str(wav_path), "rb") as wf:
-            if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
-                raise STTError("Le WAV converti doit être mono PCM 16kHz 16-bit.")
-
-            while True:
-                data = wf.readframes(4000)
-                if not data:
-                    break
-                frames_read += len(data)
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "").strip()
-                    if text:
-                        final_text_parts.append(text)
-                    partial_meta.append(result)
-
-        final_result = json.loads(recognizer.FinalResult())
-        final_text = final_result.get("text", "").strip()
-        if final_text:
-            final_text_parts.append(final_text)
-        partial_meta.append(final_result)
-
-        text = " ".join(final_text_parts).strip()
-        return text, {"segments": partial_meta, "frames_read": frames_read, "lang": lang}
+        normalized = "ar" if requested.startswith("ar") else "fr"
+        return _transcribe_wav(wav_path, normalized)
     finally:
-        for path in (raw_path, wav_path):
+        for path in [raw_path, wav_path]:
             try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
+                path.unlink(missing_ok=True)
+            except Exception:
                 pass

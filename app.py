@@ -9,11 +9,7 @@ from config import DEFAULT_STT_LANG, GENERATED_DIR, MAX_CONTENT_LENGTH
 
 
 def find_ffmpeg() -> str | None:
-    """
-    Cherche ffmpeg.exe surtout sur Windows quand il est installé avec winget
-    mais pas visible dans le PATH du process Flask.
-    """
-    candidates: list[str] = []
+    candidates = []
 
     env_path = os.getenv("FFMPEG_PATH")
     if env_path:
@@ -62,37 +58,35 @@ def find_ffmpeg() -> str | None:
 
 
 def configure_ffmpeg_path() -> str | None:
-    """
-    Ajoute automatiquement le dossier de ffmpeg.exe au PATH de Flask.
-    Les services qui appellent simplement 'ffmpeg' peuvent ensuite le trouver.
-    """
     ffmpeg_exe = find_ffmpeg()
 
     if not ffmpeg_exe:
         print("ATTENTION: ffmpeg.exe introuvable.")
-        print("Installe FFmpeg ou ajoute son dossier bin au PATH.")
-        print("Commande Windows: winget install Gyan.FFmpeg")
+        print("Commande Windows possible: winget install Gyan.FFmpeg")
         return None
 
     ffmpeg_dir = str(Path(ffmpeg_exe).parent)
     current_path = os.environ.get("PATH", "")
-
     if ffmpeg_dir not in current_path:
         os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
 
     os.environ["FFMPEG_PATH"] = ffmpeg_exe
-
     print(f"FFmpeg trouvé: {ffmpeg_exe}")
-    print(f"Dossier FFmpeg ajouté au PATH Flask: {ffmpeg_dir}")
-
     return ffmpeg_exe
 
 
-# Important: configurer FFmpeg AVANT d'importer le service STT/TTS.
 FFMPEG_EXE = configure_ffmpeg_path()
 
 from services.stt_vosk import STTError, available_languages, transcribe_audio
-from services.tts_local import TTSError, split_text_for_tts, synthesize_to_wav, tts_status
+from services.tts_local import (
+    TTSError,
+    detect_text_language,
+    normalize_tts_lang,
+    split_text_into_tts_units,
+    synthesize_to_wav,
+    tts_debug_info,
+    warmup_piper_voices,
+)
 
 
 app = Flask(__name__)
@@ -101,12 +95,11 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def simple_local_bot(message: str, lang: str) -> str:
+def simple_local_bot(message: str, lang: str = "auto") -> str:
     """
     Demo bot only.
-
-    Ici, la réponse est exactement le texte saisi ou détecté par STT.
-    Quand tu vas intégrer ton vrai chatbot, remplace seulement cette fonction.
+    Important for this prototype: return exactly the received text.
+    Replace this function with your real chatbot later.
     """
     return (message or "").strip()
 
@@ -135,7 +128,15 @@ def debug_ffmpeg():
 
 @app.get("/api/debug/tts")
 def debug_tts():
-    return jsonify(tts_status())
+    return jsonify(tts_debug_info())
+
+
+@app.post("/api/detect-language")
+def detect_language():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    lang = detect_text_language(text)
+    return jsonify({"ok": True, "lang": lang})
 
 
 @app.post("/api/stt")
@@ -159,61 +160,47 @@ def stt():
 def chat():
     data = request.get_json(silent=True) or {}
     message = data.get("message", "")
-    lang = data.get("lang", DEFAULT_STT_LANG)
-
+    lang = data.get("lang", "auto")
     reply = simple_local_bot(message, lang)
-
-    if not reply:
-        return jsonify({"ok": False, "error": "Message vide."}), 400
-
-    return jsonify({"ok": True, "reply": reply})
+    resolved_lang = normalize_tts_lang("auto", reply or message)
+    return jsonify({"ok": True, "reply": reply, "lang": resolved_lang})
 
 
 @app.post("/api/tts/chunks")
 def tts_chunks():
-    """
-    Prépare un texte long pour une lecture optimisée.
-    Le frontend lit le premier chunk pendant que le backend génère les suivants.
-    """
     data = request.get_json(silent=True) or {}
     text = data.get("text", "")
-    max_chars = data.get("max_chars", 180)
+    lang = data.get("lang", "auto")
+    max_chars = data.get("max_chars")
 
     try:
-        max_chars = int(max_chars)
-    except (TypeError, ValueError):
-        max_chars = 180
+        resolved_lang = normalize_tts_lang(lang, text)
+        chunks = split_text_into_tts_units(text, lang, int(max_chars) if max_chars else None)
+        return jsonify({"ok": True, "lang": resolved_lang, "chunks": chunks, "cached_tts": True})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Erreur découpage TTS: {exc}"}), 500
 
-    max_chars = max(80, min(max_chars, 320))
-    chunks = split_text_for_tts(text, max_chars=max_chars)
 
-    if not chunks:
-        return jsonify({"ok": False, "error": "Texte vide."}), 400
-
-    return jsonify(
-        {
-            "ok": True,
-            "chunks": [
-                {"index": index, "text": chunk, "chars": len(chunk)}
-                for index, chunk in enumerate(chunks)
-            ],
-            "count": len(chunks),
-        }
-    )
+@app.post("/api/tts/warmup")
+def tts_warmup():
+    data = request.get_json(silent=True) or {}
+    langs = data.get("langs") or ["fr", "ar"]
+    try:
+        return jsonify({"ok": True, "results": warmup_piper_voices(langs)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.post("/api/tts/chunk")
 def tts_chunk():
-    """
-    Génère un seul morceau audio.
-    """
     data = request.get_json(silent=True) or {}
     text = data.get("text", "")
-    lang = data.get("lang", DEFAULT_STT_LANG)
-    speed = data.get("speed", None)
+    lang = data.get("lang", "auto")
+    speed = data.get("speed")
 
     try:
-        audio_path = synthesize_to_wav(text, lang=lang, speed=speed)
+        resolved_lang = normalize_tts_lang(lang, text)
+        audio_path = synthesize_to_wav(text, lang=resolved_lang, speed=float(speed) if speed else None)
         return send_file(
             Path(audio_path),
             mimetype="audio/wav",
@@ -228,17 +215,14 @@ def tts_chunk():
 
 @app.post("/api/tts")
 def tts():
-    """
-    Route de compatibilité: génère un seul fichier complet.
-    Pour une lecture plus rapide, le frontend utilise /api/tts/chunks + /api/tts/chunk.
-    """
     data = request.get_json(silent=True) or {}
     text = data.get("text", "")
-    lang = data.get("lang", DEFAULT_STT_LANG)
-    speed = data.get("speed", None)
+    lang = data.get("lang", "auto")
+    speed = data.get("speed")
 
     try:
-        audio_path = synthesize_to_wav(text, lang=lang, speed=speed)
+        resolved_lang = normalize_tts_lang(lang, text)
+        audio_path = synthesize_to_wav(text, lang=resolved_lang, speed=float(speed) if speed else None)
         return send_file(
             Path(audio_path),
             mimetype="audio/wav",

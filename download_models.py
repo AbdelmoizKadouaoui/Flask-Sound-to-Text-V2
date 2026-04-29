@@ -2,9 +2,7 @@ from pathlib import Path
 from zipfile import ZipFile
 import urllib.request
 
-from config import MODELS_DIR, VOSK_MODELS
-
-DOWNLOADS_DIR = Path(__file__).resolve().parent / "downloads"
+from config import DOWNLOADS_DIR, MODELS_DIR, VOSK_MODELS
 
 
 def download_file(url: str, destination: Path) -> None:
@@ -29,15 +27,12 @@ def extract_zip(zip_path: Path, extract_to: Path) -> None:
     print("Extraction terminée.")
 
 
-def download_and_extract_model(model_key: str, model_info: dict) -> None:
-    label = model_info["label"]
-    url = model_info["url"]
-    final_model_path = Path(model_info["path"])
-    zip_path = DOWNLOADS_DIR / f"{final_model_path.name}.zip"
+def download_and_extract_model(key: str, info: dict) -> None:
+    final_model_path = MODELS_DIR / info["folder"]
+    zip_path = DOWNLOADS_DIR / f"{info['folder']}.zip"
 
     print("\n" + "=" * 70)
-    print(f"Modèle: {label}")
-    print(f"Dossier final: {final_model_path}")
+    print(f"Modèle: {info['label']}")
     print("=" * 70)
 
     if final_model_path.exists():
@@ -45,7 +40,7 @@ def download_and_extract_model(model_key: str, model_info: dict) -> None:
         return
 
     if not zip_path.exists():
-        download_file(url, zip_path)
+        download_file(info["url"], zip_path)
     else:
         print(f"ZIP déjà présent, téléchargement ignoré: {zip_path}")
 
@@ -64,18 +59,16 @@ def main() -> None:
 
     print("Téléchargement automatique de tous les modèles Vosk...")
     print(f"Dossier models: {MODELS_DIR}")
-    print(f"Dossier downloads: {DOWNLOADS_DIR}")
 
-    for model_key, model_info in VOSK_MODELS.items():
+    for key, info in VOSK_MODELS.items():
         try:
-            download_and_extract_model(model_key, model_info)
+            download_and_extract_model(key, info)
         except Exception as error:
             print("\nERREUR pendant le téléchargement/extraction.")
-            print(f"Modèle: {model_info['label']}")
+            print(f"Modèle: {info['label']}")
             print(f"Détail: {error}")
 
     print("\nTerminé.")
-    print("Les modèles Vosk disponibles sont dans le dossier models/.")
 
 
 if __name__ == "__main__":

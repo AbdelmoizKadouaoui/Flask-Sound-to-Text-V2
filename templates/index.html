@@ -12,45 +12,86 @@
       <header class="chat-header">
         <div class="avatar">AI</div>
         <div class="header-text">
-          <h1>Voice Chatbot</h1>
-          <p id="statusText">Offline Flask · Vosk STT · Piper/Local TTS</p>
+          <h1>Voice Chatbot Local</h1>
+          <p>STT Vosk auto FR/AR · TTS Piper auto</p>
         </div>
-        <select id="languageSelect" aria-label="Langue STT"></select>
+
+        <div class="header-actions">
+          <button id="autoTtsBtn" class="toggle-btn" type="button" aria-pressed="false" title="Lecture automatique après chaque réponse">
+            Auto TTS: OFF
+          </button>
+          <button id="settingsBtn" class="toggle-btn secondary" type="button" aria-expanded="false" title="Afficher les réglages audio">
+            ⚙️ Réglages
+          </button>
+        </div>
       </header>
 
-      <section id="chatWindow" class="chat-window" aria-live="polite">
-        <div class="message assistant">
+      <div id="statusBar" class="status-bar">
+        Prêt · Langue détectée automatiquement pour la lecture vocale.
+      </div>
+
+      <section id="settingsPanel" class="settings-panel hidden" aria-hidden="true">
+        <div class="settings-grid">
+          <div class="setting-item">
+            <div class="setting-head">
+              <label for="frSpeedRange">Vitesse voix française</label>
+              <strong id="frSpeedValue">0.94x</strong>
+            </div>
+            <input id="frSpeedRange" type="range" min="0.75" max="1.25" step="0.01" value="0.94">
+            <small>Plus bas = plus clair et plus naturel. Recommandé: 0.85 à 1.05.</small>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-head">
+              <label for="arSpeedRange">Vitesse voix arabe</label>
+              <strong id="arSpeedValue">1.55x</strong>
+            </div>
+            <input id="arSpeedRange" type="range" min="1.00" max="1.85" step="0.01" value="1.55">
+            <small>Plus haut = plus rapide. Recommandé: 1.25 à 1.70.</small>
+          </div>
+        </div>
+
+        <div class="settings-actions">
+          <button id="resetTtsSettingsBtn" class="mini-btn" type="button">Réinitialiser</button>
+          <span>Astuce: si la voix française parle trop vite ou avec un son moins propre, baisse légèrement la vitesse.</span>
+        </div>
+      </section>
+
+      <section id="messages" class="messages" aria-live="polite">
+        <div class="message bot">
           <div class="bubble">
-            Bonjour 👋 Écris un texte ou clique sur le micro. La réponse va répéter exactement le texte saisi ou détecté par la voix.
+            <p>Écris un texte ou enregistre ta voix. La réponse répète exactement le texte, puis peut être lue automatiquement.</p>
+            <button class="bubble-speak" type="button" data-speak="Écris un texte ou enregistre ta voix. La réponse répète exactement le texte, puis peut être lue automatiquement.">🔊</button>
           </div>
         </div>
       </section>
 
-      <footer class="composer">
-        <div class="mic-zone">
-          <button id="micButton" class="round-button" title="Enregistrer la voix" aria-label="Enregistrer la voix">
-            <span id="micIcon">🎙️</span>
-          </button>
-          <div id="voiceWave" class="voice-wave" aria-hidden="true">
-            <span></span><span></span><span></span><span></span><span></span>
-          </div>
+      <section class="composer">
+        <button id="recordBtn" class="round-btn mic" type="button" title="Enregistrer la voix">
+          <span class="mic-icon">🎙️</span>
+        </button>
+
+        <div id="wave" class="wave" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
         </div>
 
         <input id="messageInput" type="text" placeholder="Écris ton message..." autocomplete="off">
 
-        <button id="sendButton" class="send-button" title="Envoyer" aria-label="Envoyer">
-          ➤
-        </button>
+        <button id="sendBtn" class="round-btn send" type="button" title="Envoyer">➤</button>
+        <button id="speakLastBtn" class="round-btn speaker" type="button" title="Lire la dernière réponse">🔊</button>
+        <button id="stopTtsBtn" class="round-btn stop" type="button" title="Stop TTS">■</button>
+      </section>
 
-        <button id="speakButton" class="round-button speaker" title="Lire la dernière réponse" aria-label="Lire la dernière réponse">
-          🔊
-        </button>
+      <footer class="small-footer">
+        <span>STT: Auto Vosk FR/AR</span>
+        <span>Vitesse FR: <strong id="footerFrSpeed">0.94x</strong></span>
+        <span>Vitesse AR: <strong id="footerArSpeed">1.55x</strong></span>
       </footer>
     </section>
   </main>
 
   <script>
-    window.APP_DEFAULT_LANG = "{{ default_lang }}";
+    window.DEFAULT_STT_LANG = "{{ default_lang }}";
   </script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
